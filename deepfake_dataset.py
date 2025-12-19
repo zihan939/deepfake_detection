@@ -1,17 +1,16 @@
 import json
 import random
 from pathlib import Path
-from PIL import Image
+from PIL import Image, ImageFilter
 import torch
 from torch.utils.data import Dataset, DataLoader
 from torchvision import transforms
+from torchvision.transforms import functional as TF
+import io
+import numpy as np
 
 
 class DeepfakeDataset(Dataset):
-    """
-    Deepfake 视频序列数据集
-    每个样本是一个 face sequence，采样 T 帧
-    """
     
     def __init__(
         self,
@@ -22,28 +21,16 @@ class DeepfakeDataset(Dataset):
         min_frames: int = 8,
         sampling: str = "uniform",  # "uniform", "random", "consecutive"
     ):
-        """
-        Args:
-            json_path: dataset.json 路径
-            split: "train" 或 "test"
-            num_frames: 每个序列采样的帧数 T
-            image_size: 图片大小
-            min_frames: 序列最少需要多少帧才会被使用
-            sampling: 采样策略
-                - "uniform": 均匀采样
-                - "random": 随机采样
-                - "consecutive": 连续采样（随机起点）
-        """
+    
         self.num_frames = num_frames
         self.image_size = image_size
         self.sampling = sampling
         self.split = split
         
-        # 加载数据集索引
         with open(json_path, "r") as f:
             data = json.load(f)
         
-        # 过滤掉帧数太少的序列
+       
         self.samples = [
             s for s in data[split] 
             if s["num_frames"] >= min_frames
@@ -51,33 +38,96 @@ class DeepfakeDataset(Dataset):
         
         print(f"[{split}] 加载 {len(self.samples)} 个序列 (过滤掉帧数<{min_frames}的)")
         
-        # 数据增强
-        if split == "train":
-            self.transform = transforms.Compose([
-                transforms.Resize((image_size, image_size)),
-                transforms.RandomHorizontalFlip(),
-                transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2),
-                transforms.ToTensor(),
-                transforms.Normalize(
-                    mean=[0.485, 0.456, 0.406],
-                    std=[0.229, 0.224, 0.225]
-                )
-            ])
-        else:
-            self.transform = transforms.Compose([
-                transforms.Resize((image_size, image_size)),
-                transforms.ToTensor(),
-                transforms.Normalize(
-                    mean=[0.485, 0.456, 0.406],
-                    std=[0.229, 0.224, 0.225]
-                )
-            ])
+        
+        self.normalize = transforms.Normalize(
+            mean=[0.485, 0.456, 0.406],
+            std=[0.229, 0.224, 0.225]
+        )
+       
     
     def __len__(self):
         return len(self.samples)
+
+    
+    def _sample_augmentation_params(self): 
+        params = {
+            'hflip': random.random() < 0.5,
+            
+            'crop_scale': random.uniform(0.8, 1.0),
+            'crop_ratio_offset': (random.uniform(-0.1, 0.1), random.uniform(-0.1, 0.1)),
+            
+            # ColorJitter 
+            'brightness': random.uniform(0.9, 1.1),
+            'contrast': random.uniform(0.8, 1.2),
+            'saturation': random.uniform(0.8, 1.2),
+            'hue': random.uniform(-0.05, 0.05),
+            
+            # JPEG compress
+            'jpeg_quality': random.randint(70, 100),
+            'apply_jpeg': random.random() < 0.3,  # 30% 概率应用
+            
+            'blur_radius': random.uniform(0, 0.7),
+            'apply_blur': random.random() < 0.2,  # 20% 概率应用
+
+            'grayscale': random.random() < 0.1,
+            
+            'apply_noise': random.random() < 0.2,
+            'noise_std': random.uniform(5, 20),
+        }
+        return params
+
+    def _apply_consistent_augmentation(self, img, params):
+        
+
+        w, h = img.size
+        new_size = int(min(w, h) * params['crop_scale'])
+        left = int((w - new_size) / 2 + params['crop_ratio_offset'][0] * (w - new_size))
+        top = int((h - new_size) / 2 + params['crop_ratio_offset'][1] * (h - new_size))
+        left = max(0, min(left, w - new_size))
+        top = max(0, min(top, h - new_size))
+        img = TF.crop(img, top, left, new_size, new_size)
+        
+
+        img = TF.resize(img, (self.image_size, self.image_size))
+        
+
+        if params['hflip']:
+            img = TF.hflip(img)
+        
+
+        img = TF.adjust_brightness(img, params['brightness'])
+        img = TF.adjust_contrast(img, params['contrast'])
+        img = TF.adjust_saturation(img, params['saturation'])
+        img = TF.adjust_hue(img, params['hue'])
+        
+
+        if params['apply_jpeg']:
+            buffer = io.BytesIO()
+            img.save(buffer, format='JPEG', quality=params['jpeg_quality'])
+            buffer.seek(0)
+            img = Image.open(buffer).convert('RGB')
+        
+
+        if params['apply_blur']:
+            img = img.filter(ImageFilter.GaussianBlur(radius=params['blur_radius']))
+
+        if params.get('apply_noise', False):
+            img = self._add_gaussian_noise(img, params.get('noise_std', 10))
+
+        if params.get('grayscale', False):
+            img = TF.rgb_to_grayscale(img, num_output_channels=3)
+        
+        return img
+
+    def _add_gaussian_noise(self, img, std=10):
+
+        img_array = np.array(img).astype(np.float32)
+        noise = np.random.normal(0, std, img_array.shape)
+        img_array = np.clip(img_array + noise, 0, 255).astype(np.uint8)
+        return Image.fromarray(img_array)
     
     def _sample_frames(self, frames: list) -> list:
-        """根据采样策略选择 T 帧"""
+
         n = len(frames)
         T = self.num_frames
         
@@ -85,24 +135,22 @@ class DeepfakeDataset(Dataset):
             return frames
         
         if n < T:
-            # 帧数不够，重复填充
+
             indices = list(range(n))
             while len(indices) < T:
                 indices.extend(list(range(n)))
             indices = sorted(indices[:T])
             return [frames[i] for i in indices]
         
-        # n > T，需要采样
+
         if self.sampling == "uniform":
-            # 均匀采样
             indices = [int(i * n / T) for i in range(T)]
         elif self.sampling == "random":
-            # 随机采样（保持顺序）
             indices = sorted(random.sample(range(n), T))
         elif self.sampling == "consecutive":
-            # 连续采样，随机起点
-            # start = random.randint(0, n - T)
-            start = 0
+            start = random.randint(0, n - T)
+            if self.split != "train":
+                start = 0
             indices = list(range(start, start + T))
         else:
             raise ValueError(f"Unknown sampling strategy: {self.sampling}")
@@ -112,17 +160,29 @@ class DeepfakeDataset(Dataset):
     def __getitem__(self, idx):
         sample = self.samples[idx]
         
-        # 采样 T 帧
         frame_paths = self._sample_frames(sample["frames"])
         
-        # 加载并处理图片
+        if self.split == "train":
+            aug_params = self._sample_augmentation_params()
+        else:
+            aug_params = None
+        
         images = []
         for fp in frame_paths:
-            img = Image.open(fp).convert("RGB")
-            img = self.transform(img)
+            try:
+                img = Image.open(fp).convert("RGB")
+            except Exception as e:
+                return self.__getitem__((idx + 1) % len(self.samples))
+            
+            if self.split == "train":
+                img = self._apply_consistent_augmentation(img, aug_params)
+            else:
+                img = TF.resize(img, (self.image_size, self.image_size))
+            
+            img = TF.to_tensor(img)
+            img = self.normalize(img)
             images.append(img)
         
-        # 堆叠成 (T, C, H, W)
         video = torch.stack(images, dim=0)
         
         label = sample["label"]
@@ -130,7 +190,6 @@ class DeepfakeDataset(Dataset):
         return video, label
     
     def get_sample_info(self, idx):
-        """获取样本的元信息（用于调试）"""
         return self.samples[idx]
 
 
@@ -143,9 +202,7 @@ def create_dataloaders(
     min_frames: int = 8,
     sampling: str = "uniform",
 ):
-    """
-    创建训练和测试的 DataLoader
-    """
+
     train_dataset = DeepfakeDataset(
         json_path=json_path,
         split="train",
@@ -161,7 +218,15 @@ def create_dataloaders(
         num_frames=num_frames,
         image_size=image_size,
         min_frames=min_frames,
-        sampling="uniform",  # 测试时用均匀采样保证一致性
+        sampling="consecutive",  
+    )
+    val_dataset = DeepfakeDataset(
+        json_path=json_path,
+        split="val",
+        num_frames=num_frames,
+        image_size=image_size,
+        min_frames=min_frames,
+        sampling="consecutive",  
     )
     
     train_loader = DataLoader(
@@ -180,49 +245,17 @@ def create_dataloaders(
         num_workers=num_workers,
         pin_memory=True,
     )
-    
-    return train_loader, test_loader
 
+    
+    
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=num_workers,
+        pin_memory=True,
+    )
 
-# 测试代码
-if __name__ == "__main__":
-    # 测试数据集
-    json_path = "./dataset/dataset.json"
     
-    print("=" * 50)
-    print("测试 Dataset")
-    print("=" * 50)
-    
-    dataset = DeepfakeDataset(
-        json_path=json_path,
-        split="train",
-        num_frames=16,
-        image_size=224,
-    )
-    
-    # 取一个样本
-    video, label = dataset[0]
-    print(f"\n单个样本:")
-    print(f"  video shape: {video.shape}")  # 期望 (16, 3, 224, 224)
-    print(f"  label: {label}")
-    print(f"  样本信息: {dataset.get_sample_info(0)}")
-    
-    print("\n" + "=" * 50)
-    print("测试 DataLoader")
-    print("=" * 50)
-    
-    train_loader, test_loader = create_dataloaders(
-        json_path=json_path,
-        batch_size=4,
-        num_frames=16,
-        num_workers=0,  # 测试时用 0
-    )
-    
-    # 取一个 batch
-    for videos, labels in train_loader:
-        print(f"\n一个 batch:")
-        print(f"  videos shape: {videos.shape}")  # 期望 (4, 16, 3, 224, 224)
-        print(f"  labels: {labels}")
-        break
-    
-    print("\n数据集准备完成！")
+    return train_loader, test_loader, val_loader
+
